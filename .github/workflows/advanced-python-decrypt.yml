@@ -1,78 +1,78 @@
-name: Decrypt Python & Push to New Repo
+name: Advanced Python Decrypt & Upload Release
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'Direct link to encrypted/obfuscated .py file'
+        description: 'Direct download URL of the obfuscated/encrypted Python script'
         required: true
-      repo_name:
-        description: 'Name for new GitHub repo (leave empty for auto)'
-        required: false
+      release_tag:
+        description: 'GitHub release tag (e.g., v1.0)'
+        required: true
 
 jobs:
-  decrypt_and_push:
+  decrypt_and_release:
     runs-on: ubuntu-latest
-    env:
-      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install formatting tool
+      - name: Install dependencies
         run: pip install black
 
-      - name: Download obfuscated script
+      - name: Download the obfuscated script
         run: |
           curl -L "${{ github.event.inputs.file_url }}" -o input.py
           test -s input.py || (echo "Download failed or empty!" && exit 1)
 
-      - name: Add Decoder Script
+      - name: Create decoder script
         run: |
           mkdir tools
-          cat << 'EOF' > tools/custom_cleaner.py
-import base64, marshal, zlib, ast, re, builtins
+          cat > tools/custom_cleaner.py << 'EOF'
+import base64, marshal, zlib, re, builtins
 
 def decode_recursive(data: str, max_depth=10):
-    for i in range(max_depth):
+    for _ in range(max_depth):
         try:
-            if data.strip().startswith(("exec(", "eval(")):
-                data = re.sub(r'^\s*(exec|eval)\((.+)\)\s*$', r'\2', data.strip())
+            # Remove wrapping exec or eval
+            data = re.sub(r'^\s*(exec|eval)\((.+)\)\s*$', r'\2', data.strip())
 
-            if re.search(r'base64\.b64decode\((.+?)\)', data):
-                encoded = re.search(r'base64\.b64decode\((.+?)\)', data).group(1)
-                decoded = base64.b64decode(eval(encoded))
-                data = decoded.decode('utf-8', errors='ignore')
+            # Base64 decoding
+            m = re.search(r'base64\.b64decode\((.+?)\)', data)
+            if m:
+                decoded_bytes = base64.b64decode(eval(m.group(1)))
+                data = decoded_bytes.decode('utf-8', errors='ignore')
                 continue
 
+            # Marshal loads
             if "marshal.loads" in data:
-                match = re.search(r'marshal\.loads\((.+?)\)', data)
-                if match:
-                    dumped = eval(match.group(1))
+                m = re.search(r'marshal\.loads\((.+?)\)', data)
+                if m:
+                    dumped = eval(m.group(1))
                     code_obj = marshal.loads(dumped)
                     data = builtins.compile(code_obj, "<decoded>", "exec")
                     return data
 
-            if "bytes.fromhex" in data:
-                match = re.search(r'bytes\.fromhex\((.+?)\)', data)
-                if match:
-                    decoded = bytes.fromhex(eval(match.group(1))).decode()
-                    data = decoded
-                    continue
+            # bytes.fromhex
+            m = re.search(r'bytes\.fromhex\((.+?)\)', data)
+            if m:
+                data = bytes.fromhex(eval(m.group(1))).decode()
+                continue
 
-            if "zlib.decompress" in data:
-                match = re.search(r'zlib\.decompress\((.+?)\)', data)
-                if match:
-                    raw = eval(match.group(1))
-                    data = zlib.decompress(raw).decode()
-                    continue
+            # zlib decompress
+            m = re.search(r'zlib\.decompress\((.+?)\)', data)
+            if m:
+                raw = eval(m.group(1))
+                data = zlib.decompress(raw).decode()
+                continue
 
+            # Direct base64 string?
             if re.fullmatch(r'[A-Za-z0-9+/=]{40,}', data.replace('\n', '')):
                 data = base64.b64decode(data).decode()
                 continue
@@ -82,14 +82,14 @@ def decode_recursive(data: str, max_depth=10):
             break
     return data
 
-def save_output(decoded_text):
+def save_output(decoded):
     with open('output/decrypted.py', 'w', encoding='utf-8') as f:
-        if isinstance(decoded_text, str):
-            f.write(decoded_text)
+        if isinstance(decoded, str):
+            f.write(decoded)
         else:
             import dis
             f.write("# Decompiled code object:\n")
-            dis.dis(decoded_text, file=f)
+            dis.dis(decoded, file=f)
 
 if __name__ == "__main__":
     import os
@@ -102,33 +102,22 @@ EOF
       - name: Run decoder script
         run: python3 tools/custom_cleaner.py
 
-      - name: Format code with black
+      - name: Format output code
         run: black output/decrypted.py || true
 
-      - name: Prepare Git config
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Create new GitHub repo
-        id: create_repo
-        uses: peter-evans/create-or-update-repo@v2
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        id: create_release
         with:
-          token: ${{ env.GH_PAT }}
-          name: ${{ github.event.inputs.repo_name || format('decrypted-{0}', github.run_id) }}
-          description: 'Decrypted Python script repo created by workflow'
-          private: false
-          auto_init: false
+          tag: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          body: 'Automatically decrypted Python script.'
+          draft: false
+          prerelease: false
 
-      - name: Clone new repo
-        run: git clone https://x-access-token:${{ env.GH_PAT }}@github.com/${{ github.actor }}/${{ steps.create_repo.outputs.repo_name }}.git new_repo
-
-      - name: Copy decrypted code
-        run: cp output/decrypted.py new_repo/
-
-      - name: Commit & push decrypted code
-        run: |
-          cd new_repo
-          git add decrypted.py
-          git commit -m "Add decrypted python script"
-          git push origin main
+      - name: Upload decrypted script as release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          files: output/decrypted.py
+          overwrite: true
